@@ -1,9 +1,10 @@
-from flask import Flask, jsonify, request, send_from_directory
-from flask_cors import CORS
-from flask_jwt_extended import create_access_token, create_refresh_token, jwt_required, get_jwt_identity
-from flask_sqlalchemy import SQLAlchemy
-from werkzeug.security import generate_password_hash, check_password_hash
-from werkzeug.utils import secure_filename
+from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
+from jose import JWTError, jwt
+from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import os
@@ -11,230 +12,183 @@ import requests
 
 load_dotenv()
 
-# Config from environment
+# Config
 DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///taxpilot.db')
 JWT_SECRET = os.environ.get('JWT_SECRET', 'taxpilot-secret-key')
+JWT_ALGORITHM = "HS256"
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
 GROQ_MODEL = os.environ.get('GROQ_MODEL', 'llama-3.1-70b-versatile')
 
-# Flask app
-app = Flask(__name__, static_folder='public', static_url_path='')
-app.config['SECRET_KEY'] = JWT_SECRET
-app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['JWT_SECRET_KEY'] = JWT_SECRET
-app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=24)
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+# Security
+security = HTTPBearer()
 
-db = SQLAlchemy(app)
+# FastAPI app
+app = FastAPI(title="TaxPilot API")
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# In-memory DB (for demo - use real DB in production)
+users_db = {}
+folders_db = []
+documents_db = []
+next_user_id = 1
+next_folder_id = 1
+next_doc_id = 1
 
 # Models
-class User(db.Model):
-    __tablename__ = 'users'
-    id = db.Column(db.Integer, primary_key=True)
-    email = db.Column(db.String(120), unique=True, nullable=False)
-    name = db.Column(db.String(100), nullable=False)
-    password_hash = db.Column(db.String(256), nullable=False)
-    pan = db.Column(db.String(10))
-    phone = db.Column(db.String(15))
-    role = db.Column(db.String(20), default='user')
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    
-    def set_password(self, password):
-        self.password_hash = generate_password_hash(password)
-    
-    def check_password(self, password):
-        return check_password_hash(self.password_hash, password)
-    
-    def to_dict(self):
-        return {
-            'id': self.id, 'email': self.email, 'name': self.name,
-            'pan': self.pan, 'phone': self.phone, 'role': self.role,
-            'created_at': self.created_at.isoformat() if self.created_at else None
-        }
+class User(BaseModel):
+    email: str
+    name: str
+    password: str
+    pan: str = None
+    phone: str = None
 
-class Folder(db.Model):
-    __tablename__ = 'folders'
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(100), nullable=False)
-    description = db.Column(db.Text)
-    owner_id = db.Column(db.Integer, db.ForeignKey('users.id'))
-    is_shared = db.Column(db.Boolean, default=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    
-    def to_dict(self):
-        return {
-            'id': self.id, 'name': self.name, 'description': self.description,
-            'owner_id': self.owner_id, 'is_shared': self.is_shared,
-            'created_at': self.created_at.isoformat() if self.created_at else None
-        }
+class Login(BaseModel):
+    email: str
+    password: str
 
-class Document(db.Model):
-    __tablename__ = 'documents'
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(255), nullable=False)
-    document_type = db.Column(db.String(50), default='general')
-    file_path = db.Column(db.String(500))
-    file_size = db.Column(db.Integer)
-    mime_type = db.Column(db.String(100))
-    folder_id = db.Column(db.Integer, db.ForeignKey('folders.id'))
-    owner_id = db.Column(db.Integer, db.ForeignKey('users.id'))
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    
-    def to_dict(self):
-        return {
-            'id': self.id, 'name': self.name, 'document_type': self.document_type,
-            'file_path': self.file_path, 'file_size': self.file_size,
-            'mime_type': self.mime_type, 'folder_id': self.folder_id,
-            'owner_id': self.owner_id,
-            'created_at': self.created_at.isoformat() if self.created_at else None
-        }
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
 
-class TaxRecord(db.Model):
-    __tablename__ = 'tax_records'
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('users.id'))
-    assessment_year = db.Column(db.String(10))
-    gross_income = db.Column(db.Float)
-    deductions = db.Column(db.Float)
-    tax_liability = db.Column(db.Float)
-    tax_paid = db.Column(db.Float)
-    refund_due = db.Column(db.Float)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    
-    def to_dict(self):
-        return {
-            'id': self.id, 'user_id': self.user_id, 'assessment_year': self.assessment_year,
-            'gross_income': self.gross_income, 'deductions': self.deductions,
-            'tax_liability': self.tax_liability, 'tax_paid': self.tax_paid,
-            'refund_due': self.refund_due,
-            'created_at': self.created_at.isoformat() if self.created_at else None
-        }
+# Helper functions
+def create_token(user_id: int) -> str:
+    expire = datetime.utcnow() + timedelta(hours=24)
+    to_encode = {"sub": str(user_id), "exp": expire}
+    return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
-# Create tables
-with app.app_context():
-    db.create_all()
-    if not User.query.filter_by(email='admin@taxpilot.com').first():
-        admin = User(email='admin@taxpilot.com', name='Admin', role='admin')
-        admin.set_password('admin123')
-        db.session.add(admin)
-        db.session.commit()
+def verify_token(token: str) -> int:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return int(payload.get("sub"))
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-# ===================== ROUTES =====================
+async def get_current_user(request: Request):
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing token")
+    token = auth_header.split(" ")[1]
+    user_id = verify_token(token)
+    for u in users_db.values():
+        if u["id"] == user_id:
+            return u
+    raise HTTPException(status_code=401, detail="User not found")
 
-# Health
-@app.route('/api/health')
+# Routes
+@app.get("/api/health")
 def health():
-    return jsonify({'status': 'ok', 'message': 'TaxPilot API Running'})
+    return {"status": "ok", "message": "TaxPilot API Running"}
 
-# Auth
-@app.route('/api/auth/register', methods=['POST'])
-def register():
-    data = request.get_json()
-    if not data or not data.get('email') or not data.get('password') or not data.get('name'):
-        return jsonify({'error': 'Email, password, and name required'}), 400
-    if User.query.filter_by(email=data['email']).first():
-        return jsonify({'error': 'Email already registered'}), 400
-    user = User(email=data['email'], name=data['name'], pan=data.get('pan'), phone=data.get('phone'), role='user')
-    user.set_password(data['password'])
-    db.session.add(user)
-    db.session.commit()
-    return jsonify({
-        'message': 'User registered successfully',
-        'user': user.to_dict(),
-        'access_token': create_access_token(identity=user.id),
-        'refresh_token': create_refresh_token(identity=user.id)
-    }), 201
+@app.post("/api/auth/register")
+def register(user: User):
+    global next_user_id
+    if any(u["email"] == user.email for u in users_db.values()):
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    new_user = {
+        "id": next_user_id,
+        "email": user.email,
+        "name": user.name,
+        "password_hash": pwd_context.hash(user.password),
+        "pan": user.pan,
+        "phone": user.phone,
+        "role": "user"
+    }
+    users_db[next_user_id] = new_user
+    next_user_id += 1
+    
+    token = create_token(new_user["id"])
+    return {
+        "message": "User registered successfully",
+        "user": {k: v for k, v in new_user.items() if k != "password_hash"},
+        "access_token": token
+    }
 
-@app.route('/api/auth/login', methods=['POST'])
-def login():
-    data = request.get_json()
-    if not data or not data.get('email') or not data.get('password'):
-        return jsonify({'error': 'Email and password required'}), 400
-    user = User.query.filter_by(email=data['email']).first()
-    if not user or not user.check_password(data['password']):
-        return jsonify({'error': 'Invalid credentials'}), 401
-    return jsonify({
-        'message': 'Login successful',
-        'user': user.to_dict(),
-        'access_token': create_access_token(identity=user.id),
-        'refresh_token': create_refresh_token(identity=user.id)
-    }), 200
+@app.post("/api/auth/login")
+def login(credentials: Login):
+    for u in users_db.values():
+        if u["email"] == credentials.email:
+            if not pwd_context.verify(credentials.password, u["password_hash"]):
+                raise HTTPException(status_code=401, detail="Invalid credentials")
+            token = create_token(u["id"])
+            return {
+                "message": "Login successful",
+                "user": {k: v for k, v in u.items() if k != "password_hash"},
+                "access_token": token
+            }
+    raise HTTPException(status_code=401, detail="Invalid credentials")
 
-@app.route('/api/auth/profile')
-@jwt_required()
-def profile():
-    user = User.query.get(get_jwt_identity())
-    if not user:
-        return jsonify({'error': 'User not found'}), 404
-    return jsonify({'user': user.to_dict()})
+@app.get("/api/auth/profile")
+def profile(user = Depends(get_current_user)):
+    return {"user": user}
 
-# Folders
-@app.route('/api/folders')
-@jwt_required()
-def get_folders():
-    uid = get_jwt_identity()
-    folders = Folder.query.filter((Folder.owner_id == uid) | (Folder.is_shared == True)).all()
-    return jsonify({'folders': [f.to_dict() for f in folders]})
+@app.get("/api/folders")
+def get_folders(user = Depends(get_current_user)):
+    user_folders = [f for f in folders_db if f["owner_id"] == user["id"] or f.get("is_shared")]
+    return {"folders": user_folders}
 
-@app.route('/api/folders', methods=['POST'])
-@jwt_required()
-def create_folder():
-    data = request.get_json()
-    folder = Folder(name=data['name'], description=data.get('description', ''), owner_id=get_jwt_identity(), is_shared=data.get('is_shared', True))
-    db.session.add(folder)
-    db.session.commit()
-    return jsonify({'message': 'Folder created', 'folder': folder.to_dict()}), 201
+@app.post("/api/folders")
+def create_folder(data: dict, user = Depends(get_current_user)):
+    global next_folder_id
+    folder = {
+        "id": next_folder_id,
+        "name": data.get("name"),
+        "description": data.get("description", ""),
+        "owner_id": user["id"],
+        "is_shared": data.get("is_shared", True)
+    }
+    folders_db.append(folder)
+    next_folder_id += 1
+    return {"message": "Folder created", "folder": folder}
 
-@app.route('/api/folders/<int:id>/documents')
-@jwt_required()
-def folder_docs(id):
-    docs = Document.query.filter_by(folder_id=id, owner_id=get_jwt_identity()).all()
-    return jsonify({'documents': [d.to_dict() for d in docs]})
+@app.get("/api/folders/{folder_id}/documents")
+def folder_documents(folder_id: int, user = Depends(get_current_user)):
+    docs = [d for d in documents_db if d["folder_id"] == folder_id and d["owner_id"] == user["id"]]
+    return {"documents": docs}
 
-# Documents
-@app.route('/api/documents')
-@jwt_required()
-def get_docs():
-    page = request.args.get('page', 1, type=int)
-    per_page = request.args.get('per_page', 20, type=int)
-    docs = Document.query.filter_by(owner_id=get_jwt_identity()).paginate(page=page, per_page=per_page, error_out=False)
-    return jsonify({'documents': [d.to_dict() for d in docs.items], 'total': docs.total, 'pages': docs.pages})
+@app.get("/api/documents")
+def get_documents(user = Depends(get_current_user)):
+    user_docs = [d for d in documents_db if d["owner_id"] == user["id"]]
+    return {"documents": user_docs}
 
-@app.route('/api/documents/upload', methods=['POST'])
-@jwt_required()
-def upload_doc():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file provided'}), 400
-    file = request.files['file']
-    if not file.filename:
-        return jsonify({'error': 'No file selected'}), 400
-    doc = Document(
-        name=secure_filename(file.filename),
-        document_type=request.form.get('document_type', 'general'),
-        file_size=len(file.read()),
-        mime_type=file.content_type or 'application/octet-stream',
-        folder_id=request.form.get('folder_id', type=int),
-        owner_id=get_jwt_identity()
-    )
-    db.session.add(doc)
-    db.session.commit()
-    return jsonify({'message': 'Document uploaded', 'document': doc.to_dict()}), 201
+@app.post("/api/documents/upload")
+def upload_document(data: dict, user = Depends(get_current_user)):
+    global next_doc_id
+    doc = {
+        "id": next_doc_id,
+        "name": data.get("name", "untitled"),
+        "document_type": data.get("document_type", "general"),
+        "folder_id": data.get("folder_id"),
+        "owner_id": user["id"]
+    }
+    documents_db.append(doc)
+    next_doc_id += 1
+    return {"message": "Document uploaded", "document": doc}
 
-@app.route('/api/documents/<int:id>', methods=['DELETE'])
-@jwt_required()
-def delete_doc(id):
-    doc = Document.query.filter_by(id=id, owner_id=get_jwt_identity()).first_or_404()
-    db.session.delete(doc)
-    db.session.commit()
-    return jsonify({'message': 'Document deleted'})
+@app.delete("/api/documents/{doc_id}")
+def delete_document(doc_id: int, user = Depends(get_current_user)):
+    global documents_db
+    doc = next((d for d in documents_db if d["id"] == doc_id and d["owner_id"] == user["id"]), None)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    documents_db = [d for d in documents_db if d["id"] != doc_id]
+    return {"message": "Document deleted"}
 
-@app.route('/api/documents/types')
-def doc_types():
-    return jsonify({'types': ['general', 'form16', 'form26as', 'investment', 'receipt', 'other']})
+@app.get("/api/documents/types")
+def document_types():
+    return {"types": ["general", "form16", "form26as", "investment", "receipt", "other"]}
 
-# Tax
 def calc_tax(income, deductions, age='general'):
     taxable = max(0, income - deductions)
     exempt = 500000 if age == 'super_senior' else (300000 if age == 'senior' else 250000)
@@ -248,75 +202,77 @@ def calc_tax(income, deductions, age='general'):
     else: tax = 25000 + 100000 + 100000 + 150000 + (taxable - 2000000) * 0.30
     return {'taxable_income': taxable, 'tax_before_cess': tax, 'cess': tax * 0.04, 'total_tax': tax * 1.04}
 
-@app.route('/api/tax/calculate', methods=['POST'])
-@jwt_required()
-def tax_calc():
-    d = request.get_json()
-    return jsonify({'result': calc_tax(float(d.get('income', 0)), float(d.get('deductions', 0)), d.get('age', 'general'))})
+@app.post("/api/tax/calculate")
+def tax_calculate(data: dict, user = Depends(get_current_user)):
+    return {"result": calc_tax(float(data.get('income', 0)), float(data.get('deductions', 0)), data.get('age', 'general'))}
 
-@app.route('/api/tax/slabs')
+@app.get("/api/tax/slabs")
 def tax_slabs():
-    return jsonify({'slabs': [
-        {'range': '0 - 2,50,000', 'rate': 'NIL'},
-        {'range': '2,50,001 - 5,00,000', 'rate': '5%'},
-        {'range': '5,00,001 - 10,00,000', 'rate': '20%'},
-        {'range': 'Above 10,00,000', 'rate': '30%'}
-    ]})
+    return {"slabs": [
+        {"range": "0 - 2,50,000", "rate": "NIL"},
+        {"range": "2,50,001 - 5,00,000", "rate": "5%"},
+        {"range": "5,00,001 - 10,00,000", "rate": "20%"},
+        {"range": "Above 10,00,000", "rate": "30%"}
+    ]}
 
-@app.route('/api/tax/suggestions')
+@app.get("/api/tax/suggestions")
 def tax_suggestions():
-    return jsonify({'suggestions': [
-        'Maximize 80C deductions (PPF, ELSS, Life Insurance)',
-        'Invest in NPS for 80CCD(1B) extra deduction',
-        'Health Insurance premium under 80D',
-        'Home loan interest under 80EE',
-        'Donations under 80G'
-    ]})
+    return {"suggestions": [
+        "Maximize 80C deductions (PPF, ELSS, Life Insurance)",
+        "Invest in NPS for 80CCD(1B) extra deduction",
+        "Health Insurance premium under 80D"
+    ]}
 
-# Chatbot
-@app.route('/api/chatbot/query', methods=['POST'])
-def chatbot():
-    data = request.get_json()
-    message = data.get('message', '')
+@app.post("/api/chatbot/query")
+def chatbot(data: dict):
+    message = data.get("message", "")
     if not message:
-        return jsonify({'error': 'Message required'}), 400
+        raise HTTPException(status_code=400, detail="Message required")
     if not GROQ_API_KEY:
-        return jsonify({'response': 'Chatbot not configured. Set GROQ_API_KEY.'})
+        return {"response": "Chatbot not configured. Set GROQ_API_KEY."}
     try:
         resp = requests.post('https://api.groq.com/openai/v1/chat/completions',
             headers={'Authorization': f'Bearer {GROQ_API_KEY}', 'Content-Type': 'application/json'},
             json={'model': GROQ_MODEL, 'messages': [
-                {"role": "system", "content": "You are an Indian tax assistant. Help with income tax, ITR filing, Section 80C, 80D, etc."},
+                {"role": "system", "content": "You are an Indian tax assistant."},
                 {"role": "user", "content": message}
             ], 'temperature': 0.7}, timeout=30)
         if resp.status_code == 200:
-            return jsonify({'response': resp.json()['choices'][0]['message']['content']})
-        return jsonify({'response': 'Error from Groq API', 'error': resp.text}), 500
+            return {"response": resp.json()['choices'][0]['message']['content']}
+        return {"response": "Error from API", "error": resp.text}
     except Exception as e:
-        return jsonify({'response': 'Chatbot unavailable', 'error': str(e)}), 500
+        return {"response": "Chatbot unavailable", "error": str(e)}
 
-@app.route('/api/chatbot/topics')
+@app.get("/api/chatbot/topics")
 def chatbot_topics():
-    return jsonify({'topics': ['Income Tax Basics', 'ITR Filing', 'Section 80C', 'Section 80D', 'Form 16', 'PAN Card']})
+    return {"topics": ["Income Tax Basics", "ITR Filing", "Section 80C", "Section 80D"]}
 
-@app.route('/api/chatbot/quick-actions')
+@app.get("/api/chatbot/quick-actions")
 def chatbot_actions():
-    return jsonify({'actions': [
-        {'action': 'Calculate Tax', 'icon': 'calculator'},
-        {'action': 'File ITR', 'icon': 'document'},
-        {'action': 'View Deductions', 'icon': 'savings'},
-        {'action': 'Upload Form 16', 'icon': 'upload'}
-    ]})
+    return {"actions": [
+        {"action": "Calculate Tax", "icon": "calculator"},
+        {"action": "File ITR", "icon": "document"}
+    ]}
 
 # Admin Panel (Static files)
-@app.route('/admin')
-@app.route('/admin/<path:filename>')
-def admin_panel(filename='index.html'):
-    return send_from_directory('public/admin', filename)
+@app.get("/admin")
+@app.get("/admin/{filename}")
+def admin_panel(filename: str = "index.html"):
+    return FileResponse(f"public/admin/{filename}")
 
-@app.route('/')
+@app.get("/")
 def root():
-    return send_from_directory('public', 'index.html')
+    return FileResponse("public/index.html")
 
-# Vercel handler
-app_entry = app
+# Create admin user on startup
+admin_user = {
+    "id": next_user_id,
+    "email": "admin@taxpilot.com",
+    "name": "Admin",
+    "password_hash": pwd_context.hash("admin123"),
+    "pan": None,
+    "phone": None,
+    "role": "admin"
+}
+users_db[next_user_id] = admin_user
+next_user_id += 1
